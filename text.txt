@@ -1,0 +1,372 @@
+import os
+import glob
+import json
+import tomllib  # Python 3.11+; for 3.10 use 'tomli' instead
+import requests
+from urllib.parse import urljoin
+
+def load_toml_file(path: str) -> dict:
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+def get_kibana_base_url() -> str:
+    # Prefer explicit URL; fall back to env
+    kibana_url = os.environ.get("KIBANA_URL")
+    if not kibana_url:
+        raise RuntimeError("KIBANA_URL environment variable is required")
+    return kibana_url.rstrip("/") + "/"
+
+def get_auth_headers() -> dict:
+    api_key = os.environ.get("ELASTIC_API_KEY")
+    username = os.environ.get("ELASTIC_USERNAME")
+    password = os.environ.get("ELASTIC_PASSWORD")
+
+    headers = {
+        "kbn-xsrf": "true",
+        "Content-Type": "application/json"
+    }
+
+    if api_key:
+        headers["Authorization"] = f"ApiKey {api_key}"
+    elif username and password:
+        # Basic auth will be provided via 'auth' parameter in requests
+        pass
+    else:
+        raise RuntimeError(
+            "Either ELASTIC_API_KEY or ELASTIC_USERNAME/ELASTIC_PASSWORD must be set"
+        )
+
+    return headers
+
+def get_auth_tuple():
+    username = os.environ.get("ELASTIC_USERNAME")
+    password = os.environ.get("ELASTIC_PASSWORD")
+    if username and password:
+        return (username, password)
+    return None
+
+def toml_to_rule_payload(toml_data: dict) -> dict:
+    """
+    Map TOML fields to Elastic Detection Engine rule schema.
+    This is a minimal subset; expand as needed.
+    """
+    name = toml_data["name"]
+    rule_id = toml_data["rule_id"]
+    index = toml_data.get("index", [])
+    query = toml_data["query"]
+    rule_type = toml_data.get("type", "query")
+    severity = toml_data.get("severity", "medium")
+    risk_score = toml_data.get("risk_score", 50)
+    enabled = toml_data.get("enabled", True)
+    interval = toml_data.get("interval", "5m")
+    from_time = toml_data.get("from", "now-15m")
+    tags = toml_data.get("tags", [])
+
+    payload = {
+        "name": name,
+        "rule_id": rule_id,
+        "index": index,
+        "query": query,
+        "type": rule_type,
+        "severity": severity,
+        "risk_score": risk_score,
+        "enabled": enabled,
+        "interval": interval,
+        "from": from_time,
+        "tags": tags,
+        "language": "kuery",  # or "lucene" if needed
+    }
+
+    # Optional metadata block
+    metadata = toml_data.get("metadata")
+    if metadata:
+        payload["meta"] = metadata
+
+    return payload
+
+def upsert_rule(kibana_url: str, headers: dict, auth, rule_payload: dict):
+    """
+    Upsert a detection rule via Kibana Detection Engine API.
+    POST /api/detection_engine/rule with rule_id will create or update.
+    """
+    rules_endpoint = urljoin(kibana_url, "api/detection_engine/rule")
+    response = requests.post(
+        rules_endpoint,
+        headers=headers,
+        auth=auth,
+        data=json.dumps(rule_payload),
+        verify=True,
+    )
+
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            f"Failed to upsert rule {rule_payload.get('rule_id')}: "
+            f"{response.status_code} {response.text}"
+        )
+
+    return response.json()
+
+def main():
+    kibana_url = get_kibana_base_url()
+    headers = get_auth_headers()
+    auth = get_auth_tuple()
+
+    detection_files = glob.glob("detections/*.toml")
+    if not detection_files:
+        print("No detections/*.toml files found. Nothing to deploy.")
+        return
+
+    print(f"Found {len(detection_files)} detection file(s). Deploying...")
+
+    for path in detection_files:
+        print(f"Processing: {path}")
+        toml_data = load_toml_file(path)
+        rule_payload = toml_to_rule_payload(toml_data)
+        result = upsert_rule(kibana_url, headers, auth, rule_payload)
+        print(f"  ✅ Upserted rule: {result.get('name')} ({result.get('rule_id')})")
+
+    print("All rules processed.")
+
+if __name__ == "__main__":
+    main()
+
+
+dac.yml 
+
+name: Detection as Code Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  validate-and-deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      # Non-secret env (can also set per-environment in GitHub)
+      KIBANA_URL: ${{ secrets.KIBANA_URL }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Validate TOML detections
+        run: |
+          python - << 'EOF'
+          import glob, tomllib
+          files = glob.glob("detections/*.toml")
+          if not files:
+              raise SystemExit("No detections/*.toml files found")
+          for f in files:
+              with open(f, "rb") as fh:
+                  tomllib.load(fh)
+              print(f"Validated TOML: {f}")
+          EOF
+
+      - name: Deploy rules to Elastic
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          ELASTIC_API_KEY: ${{ secrets.ELASTIC_API_KEY }}
+          ELASTIC_USERNAME: ${{ secrets.ELASTIC_USERNAME }}
+          ELASTIC_PASSWORD: ${{ secrets.ELASTIC_PASSWORD }}
+          KIBANA_URL: ${{ secrets.KIBANA_URL }}
+        run: |
+          python scripts/deploy_rules.py
+
+
+config/elastic.toml
+
+kibana_url = "https://your-kibana.example.com"
+
+api_key = "YOUR_API_KEY_BASE64"          
+
+space_id = "default"
+
+detection/first_rule.toml
+
+# Human-readable rule name
+name = "Suspicious use of tar for data archiving"
+
+# Unique rule_id you own (use a UUID or stable string)
+rule_id = "dac-tar-suspicious-001"
+
+# Elastic-specific fields
+index = ["logs-endpoint.events.process-*"]
+query = """
+process.name: "tar" AND process.args:("*cvfz*" OR "*xvf*")
+"""
+
+# Rule type: "query", "eql", "threshold", etc.
+type = "query"
+
+severity = "medium"          # low | medium | high | critical
+risk_score = 50              # 1–100
+enabled = true
+
+# How often rule runs
+interval = "5m"
+
+# Look-back time window
+from = "now-15m"
+
+# Tags help grouping & filtering
+tags = ["dac", "linux", "exfiltration", "endpoint"]
+
+# Optional metadata
+[metadata]
+author = "Your Name"
+version = 1
+note = "Basic tar-based exfil detection"
+references = ["https://attack.mitre.org/techniques/T1560/"]
+
+scripts/deploy_rules.py
+
+import os
+import glob
+import json
+import tomllib  # Python 3.11+; for 3.10 use 'tomli' instead
+import requests
+from urllib.parse import urljoin
+
+def load_toml_file(path: str) -> dict:
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+def get_kibana_base_url() -> str:
+    # Prefer explicit URL; fall back to env
+    kibana_url = os.environ.get("KIBANA_URL")
+    if not kibana_url:
+        raise RuntimeError("KIBANA_URL environment variable is required")
+    return kibana_url.rstrip("/") + "/"
+
+def get_auth_headers() -> dict:
+    api_key = os.environ.get("ELASTIC_API_KEY")
+    username = os.environ.get("ELASTIC_USERNAME")
+    password = os.environ.get("ELASTIC_PASSWORD")
+
+    headers = {
+        "kbn-xsrf": "true",
+        "Content-Type": "application/json"
+    }
+
+    if api_key:
+        headers["Authorization"] = f"ApiKey {api_key}"
+    elif username and password:
+        # Basic auth will be provided via 'auth' parameter in requests
+        pass
+    else:
+        raise RuntimeError(
+            "Either ELASTIC_API_KEY or ELASTIC_USERNAME/ELASTIC_PASSWORD must be set"
+        )
+
+    return headers
+
+def get_auth_tuple():
+    username = os.environ.get("ELASTIC_USERNAME")
+    password = os.environ.get("ELASTIC_PASSWORD")
+    if username and password:
+        return (username, password)
+    return None
+
+def toml_to_rule_payload(toml_data: dict) -> dict:
+    """
+    Map TOML fields to Elastic Detection Engine rule schema.
+    This is a minimal subset; expand as needed.
+    """
+    name = toml_data["name"]
+    rule_id = toml_data["rule_id"]
+    index = toml_data.get("index", [])
+    query = toml_data["query"]
+    rule_type = toml_data.get("type", "query")
+    severity = toml_data.get("severity", "medium")
+    risk_score = toml_data.get("risk_score", 50)
+    enabled = toml_data.get("enabled", True)
+    interval = toml_data.get("interval", "5m")
+    from_time = toml_data.get("from", "now-15m")
+    tags = toml_data.get("tags", [])
+
+    payload = {
+        "name": name,
+        "rule_id": rule_id,
+        "index": index,
+        "query": query,
+        "type": rule_type,
+        "severity": severity,
+        "risk_score": risk_score,
+        "enabled": enabled,
+        "interval": interval,
+        "from": from_time,
+        "tags": tags,
+        "language": "kuery",  # or "lucene" if needed
+    }
+
+    # Optional metadata block
+    metadata = toml_data.get("metadata")
+    if metadata:
+        payload["meta"] = metadata
+
+    return payload
+
+def upsert_rule(kibana_url: str, headers: dict, auth, rule_payload: dict):
+    """
+    Upsert a detection rule via Kibana Detection Engine API.
+    POST /api/detection_engine/rule with rule_id will create or update.
+    """
+    rules_endpoint = urljoin(kibana_url, "api/detection_engine/rule")
+    response = requests.post(
+        rules_endpoint,
+        headers=headers,
+        auth=auth,
+        data=json.dumps(rule_payload),
+        verify=True,
+    )
+
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            f"Failed to upsert rule {rule_payload.get('rule_id')}: "
+            f"{response.status_code} {response.text}"
+        )
+
+    return response.json()
+
+def main():
+    kibana_url = get_kibana_base_url()
+    headers = get_auth_headers()
+    auth = get_auth_tuple()
+
+    detection_files = glob.glob("detections/*.toml")
+    if not detection_files:
+        print("No detections/*.toml files found. Nothing to deploy.")
+        return
+
+    print(f"Found {len(detection_files)} detection file(s). Deploying...")
+
+    for path in detection_files:
+        print(f"Processing: {path}")
+        toml_data = load_toml_file(path)
+        rule_payload = toml_to_rule_payload(toml_data)
+        result = upsert_rule(kibana_url, headers, auth, rule_payload)
+        print(f"  ✅ Upserted rule: {result.get('name')} ({result.get('rule_id')})")
+
+    print("All rules processed.")
+
+if __name__ == "__main__":
+    main()
+
+.gitignore
+
+
+
